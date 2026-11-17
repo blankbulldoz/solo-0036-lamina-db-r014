@@ -3,7 +3,8 @@
 *.log
 .env
 .env.*
-*token*
+# runtime secret material (e.g. data-dir cursor.secret); source files named
+# token.go under internal/ must still be tracked
 *secret*
 *.key
 *.pem

@@ -64,7 +64,7 @@ func respondError(w http.ResponseWriter, err error) {
 			status = 404
 		case "conflict":
 			status = 409
-		case "snapshot":
+		case "snapshot", "cursor_expired":
 			status = 410
 		case "capacity":
 			status = 429
@@ -93,6 +93,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"/get", s.get)
 	s.mux.HandleFunc("POST "+p+"/query", s.query)
 	s.mux.HandleFunc("POST "+p+"/sql", s.sql)
+	s.mux.HandleFunc("POST "+p+"/cursors", s.openCursor)
+	s.mux.HandleFunc("POST "+p+"/cursors/next", s.continueCursor)
+	s.mux.HandleFunc("POST "+p+"/cursors/close", s.closeCursor)
 	s.mux.HandleFunc("POST "+p+"/checkpoint", s.checkpoint)
 	s.mux.HandleFunc("POST "+p+"/vacuum", s.vacuum)
 	s.mux.HandleFunc("GET "+p+"/backup", s.backup)

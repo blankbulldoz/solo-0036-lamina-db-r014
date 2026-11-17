@@ -8,6 +8,8 @@ import (
 	"sort"
 )
 
+var errInvalidPosition = fmt.Errorf("cursor position does not match its query ordering")
+
 func Execute(r catalog.Relation, q Request, rows map[string]datum.Row, plan Plan, keys []string) (Result, error) {
 	result := Result{Rows: []datum.Row{}, Plan: plan}
 	if plan.Access == "scan" {
@@ -34,16 +36,7 @@ func Execute(r catalog.Relation, q Request, rows map[string]datum.Row, plan Plan
 		return result, nil
 	}
 	sort.Slice(selected, func(i, j int) bool {
-		for _, o := range q.Order {
-			n := datum.Order(selected[i][o.Column], selected[j][o.Column])
-			if n != 0 {
-				if o.Desc {
-					return n > 0
-				}
-				return n < 0
-			}
-		}
-		return datum.Order(selected[i][r.Primary], selected[j][r.Primary]) < 0
+		return RowLess(r, q.Order, selected[i], selected[j])
 	})
 	limit := q.Limit
 	if limit == 0 {

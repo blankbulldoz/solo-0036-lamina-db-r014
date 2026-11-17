@@ -149,6 +149,7 @@ func (d *DB) Rollback(id string) error {
 	if _, err := d.tx(id); err != nil {
 		return err
 	}
+	d.dropTransactionCursors(id)
 	delete(d.transactions, id)
 	return nil
 }
@@ -162,7 +163,10 @@ func (d *DB) Commit(id string) (Commit, error) {
 	if err != nil {
 		return Commit{}, err
 	}
-	defer delete(d.transactions, id)
+	defer func() {
+		d.dropTransactionCursors(id)
+		delete(d.transactions, id)
+	}()
 	writes := make([]versions.Mutation, 0)
 	for table, mutations := range tx.writes {
 		for key, m := range mutations {

@@ -85,6 +85,12 @@ func (d *DB) Vacuum(requested uint64) (versions.VacuumResult, error) {
 			horizon = tx.Snapshot
 		}
 	}
+	// Open cursors hold the same snapshot guarantee as active read
+	// transactions: a traversal mid-flight must still see every version its
+	// frozen snapshot needs, so the vacuum horizon cannot pass its pin.
+	if pinned, ok := d.cursorHorizon(); ok && pinned < horizon {
+		horizon = pinned
+	}
 	beforeKeys, beforeVersions := d.store.Count()
 	_ = beforeKeys
 	if err := d.publish(journal.Record{Kind: "vacuum", Horizon: horizon}); err != nil {

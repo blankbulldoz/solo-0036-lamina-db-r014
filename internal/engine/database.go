@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"lamina/internal/catalog"
+	"lamina/internal/cursor"
 	"lamina/internal/index"
 	"lamina/internal/journal"
 	"lamina/internal/snapshot"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 type DB struct {
@@ -22,10 +24,19 @@ type DB struct {
 	sequence     uint64
 	horizon      uint64
 	transactions map[string]*Transaction
-	closed       bool
-	commits      uint64
-	conflicts    uint64
-	queries      uint64
+	cursors      map[string]*cursorSession
+	// closedCursors is an in-memory tombstone map distinguishing explicit
+	// closes from process restarts while this instance stays alive. The
+	// value is the token's idle deadline, after which the tombstone is
+	// reaped by the sweeper.
+	closedCursors map[string]time.Time
+	cursorSecret  []byte
+	cursorStop    chan struct{}
+	cursorDone    chan struct{}
+	closed        bool
+	commits       uint64
+	conflicts     uint64
+	queries       uint64
 }
 
 func Open(dir string) (*DB, error) {
@@ -47,7 +58,13 @@ func Open(dir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}}
+	d := &DB{dir: absolute, catalog: catalog.New(), store: versions.New(), wal: w, transactions: map[string]*Transaction{}, cursors: map[string]*cursorSession{}, closedCursors: map[string]time.Time{}}
+	secret, err := cursor.LoadSecret(absolute)
+	if err != nil {
+		w.Close()
+		return nil, fmt.Errorf("cursor secret: %w", err)
+	}
+	d.cursorSecret = secret
 	if !missing {
 		d.catalog = image.Catalog
 		d.store = image.Store
@@ -75,6 +92,7 @@ func Open(dir string) (*DB, error) {
 			return nil, fmt.Errorf("recovered constraints: %w", err)
 		}
 	}
+	d.startCursorSweeper()
 	return d, nil
 }
 func (d *DB) usable() error {
@@ -88,12 +106,19 @@ func (d *DB) usable() error {
 }
 func (d *DB) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.closed {
+		d.mu.Unlock()
 		return nil
 	}
 	d.closed = true
 	d.transactions = map[string]*Transaction{}
+	d.cursors = map[string]*cursorSession{}
+	stop, done := d.cursorStop, d.cursorDone
+	d.mu.Unlock()
+	if stop != nil {
+		close(stop)
+		<-done
+	}
 	return d.wal.Close()
 }
 func (d *DB) publish(r journal.Record) error {

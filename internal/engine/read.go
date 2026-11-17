@@ -1,42 +1,42 @@
 package engine
 
 import (
+	"lamina/internal/catalog"
 	"lamina/internal/datum"
 	"lamina/internal/query"
 )
 
-func (d *DB) Query(q query.Request) (query.Result, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if err := d.usable(); err != nil {
-		return query.Result{}, err
-	}
+// snapshotRead resolves the snapshot of a query request, binds it against the
+// current catalog and materializes the visible rows together with the access
+// plan. It is the shared entry point of one-shot queries and cursor pages so
+// both keep exactly the same read semantics. The caller must hold d.mu.
+func (d *DB) snapshotRead(q query.Request) (catalog.Relation, query.Plan, map[string]datum.Row, []string, *Transaction, error) {
 	r, err := d.catalog.Relation(q.Relation)
 	if err != nil {
-		return query.Result{}, invalid(err)
+		return catalog.Relation{}, query.Plan{}, nil, nil, nil, invalid(err)
 	}
 	at := d.sequence
 	var tx *Transaction
 	if q.Transaction != "" {
 		if q.At != nil {
-			return query.Result{}, fault("invalid", "at and transaction are mutually exclusive")
+			return catalog.Relation{}, query.Plan{}, nil, nil, nil, fault("invalid", "at and transaction are mutually exclusive")
 		}
 		tx, err = d.tx(q.Transaction)
 		if err != nil {
-			return query.Result{}, err
+			return catalog.Relation{}, query.Plan{}, nil, nil, nil, err
 		}
 		at = tx.Snapshot
 	} else if q.At != nil {
 		at = *q.At
 	}
 	if at < d.horizon || at > d.sequence {
-		return query.Result{}, fault("snapshot", "snapshot unavailable; retained interval %d..%d", d.horizon, d.sequence)
+		return catalog.Relation{}, query.Plan{}, nil, nil, nil, fault("snapshot", "snapshot unavailable; retained interval %d..%d", d.horizon, d.sequence)
 	}
 	if at < r.Created {
-		return query.Result{}, fault("snapshot", "relation did not exist at snapshot")
+		return catalog.Relation{}, query.Plan{}, nil, nil, nil, fault("snapshot", "relation did not exist at snapshot")
 	}
 	if err = query.Bind(r, q); err != nil {
-		return query.Result{}, invalid(err)
+		return catalog.Relation{}, query.Plan{}, nil, nil, nil, invalid(err)
 	}
 	if tx != nil && len(tx.writes[q.Relation]) > 0 {
 		q.ForceScan = true
@@ -54,6 +54,19 @@ func (d *DB) Query(q query.Request) (query.Result, error) {
 	}
 	if tx != nil {
 		overlay(rows, tx.writes, q.Relation)
+	}
+	return r, plan, rows, keys, tx, nil
+}
+
+func (d *DB) Query(q query.Request) (query.Result, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.usable(); err != nil {
+		return query.Result{}, err
+	}
+	r, plan, rows, keys, _, err := d.snapshotRead(q)
+	if err != nil {
+		return query.Result{}, err
 	}
 	result, err := query.Execute(r, q, rows, plan, keys)
 	d.queries++

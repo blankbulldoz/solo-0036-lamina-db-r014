@@ -37,7 +37,13 @@
       "id": "query",
       "name": "query",
       "path": "internal/query",
-      "responsibility": "predicate binding, access selection, projection, ordering and aggregation"
+      "responsibility": "predicate binding, access selection, projection, ordering, keyset paging and aggregation"
+    },
+    {
+      "id": "cursor",
+      "name": "cursor",
+      "path": "internal/cursor",
+      "responsibility": "opaque HMAC-signed resumable traversal tokens and per-instance secret storage"
     },
     {
       "id": "snapshot",
@@ -49,7 +55,7 @@
       "id": "engine",
       "name": "engine",
       "path": "internal/engine",
-      "responsibility": "transaction lifecycles, conflict and constraint validation before durable publish"
+      "responsibility": "transaction lifecycles, conflict and constraint validation before durable publish, cursor sessions and snapshot pins"
     },
     {
       "id": "transport",
@@ -368,6 +374,29 @@
       "success": "query execution facts and database resource state produces a verified domain result",
       "failure": "candidates vs scanned vs returned have distinct meanings",
       "verification": "python3 examples/walkthrough.py --workflow statistics"
+    },
+    {
+      "id": "cursor-paging",
+      "name": "keyset cursor traversal with pinned snapshot and idle expiry",
+      "entry": "POST /cursors, /cursors/next, /cursors/close",
+      "steps": [
+        "transport",
+        "cursor",
+        "engine",
+        "query",
+        "versions"
+      ],
+      "module_ids": [
+        "transport",
+        "cursor",
+        "engine",
+        "query",
+        "versions",
+        "datum"
+      ],
+      "success": "batched pages reproduce one fixed-snapshot, total-order result with no skipped or duplicated rows, resumable after restart",
+      "failure": "idle expiry and reclaimed snapshots return explainable 410; forged, closed or stale tokens are refused",
+      "verification": "python3 examples/walkthrough.py --workflow cursor-paging"
     }
   ],
   "complexity": {

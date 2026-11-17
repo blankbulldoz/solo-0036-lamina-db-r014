@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','cursor-paging']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -38,6 +38,18 @@ class Session:
  def commit(self,tx,status=200):return self.call('POST',f'/transactions/{tx}/commit',status=status)
  def query(self,**kwargs):return self.call('POST','/query',{'relation':'spectra',**kwargs})
  def stats(self):return self.call('GET','/stats')
+ def open_cursor(self,ttl=None,**kwargs):
+  body={'query':{'relation':'spectra',**kwargs}}
+  if ttl is not None:body['ttl_seconds']=ttl
+  return self.call('POST','/cursors',body,201)
+ def next_page(self,token):return self.call('POST','/cursors/next',{'cursor':token})
+ def close_cursor(self,token):return self.call('POST','/cursors/close',{'cursor':token})
+ def drain_cursor(self,first):
+  pages=[first];seen=[r['sample'] for r in first['rows']];token=first.get('cursor')
+  while token:
+   page=self.next_page(token);pages.append(page);seen += [r['sample'] for r in page['rows']];token=page.get('cursor')
+  require(pages[-1]['done'] is True and 'cursor' not in pages[-1],'final page did not report completion')
+  return seen,pages
 def require(condition,message):
  if not condition:raise RuntimeError(message)
 def tuple_(n,band=None,amplitude=None):return {'sample':n,'band':band or f'b{n}','amplitude':n*10 if amplitude is None else amplitude,'valid':True}
@@ -152,6 +164,63 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='cursor-paging':
+    open_tokens=[]
+    # batch size two over the seven seeded rows: no gaps, no duplicates,
+    # the same snapshot on every page and an explicit completion marker
+    first=s.open_cursor(order=[{'column':'sample'}],limit=2)
+    seen,pages=s.drain_cursor(first)
+    require(seen==list(range(1,8)),'keyset pages skipped or duplicated rows')
+    require(all(p['snapshot']==first['snapshot'] for p in pages),'cursor snapshot drifted between pages')
+    # equal sort values are tie-broken by the primary key exactly like /query
+    tx=s.begin();s.put(tx,tuple_(1,amplitude=5));s.put(tx,tuple_(2,amplitude=5));s.commit(tx)
+    tied=s.open_cursor(order=[{'column':'amplitude'},{'column':'sample'}],limit=3)
+    tied_seen,_=s.drain_cursor(tied)
+    ref=s.query(order=[{'column':'amplitude'},{'column':'sample'}])
+    require(tied_seen==[r['sample'] for r in ref['rows']],'cursor ordering diverged from one-shot query')
+    # concurrent writes and deletes cannot change an open traversal's view.
+    # Only the first page is consumed, so the session stays open and keeps
+    # pinning its snapshot for the vacuum observation below.
+    frozen=s.open_cursor(limit=3);open_tokens.append(frozen['cursor']);frozen_snap=frozen['snapshot']
+    writer=s.begin();s.put(writer,tuple_(8));s.put(writer,tuple_(1,amplitude=999));s.call('POST',f'/transactions/{writer}/delete',{'relation':'spectra','key':5});s.commit(writer)
+    second=s.next_page(frozen['cursor'])
+    partial=[r['sample'] for r in frozen['rows']]+[r['sample'] for r in second['rows']]
+    require(8 not in partial and 5 in partial and all(r['amplitude']!=999 for r in frozen['rows']+second['rows']),'cursor saw rows outside its snapshot')
+    require(frozen['rows'][0]['amplitude']==5,'cursor did not keep snapshot values')
+    # an open cursor pins vacuum; once every cursor is closed the horizon advances
+    head=s.stats()['sequence']
+    vac=s.call('POST','/vacuum',{'horizon':head});require(vac['pinned'] and vac['horizon']<=frozen_snap,'vacuum crossed an open cursor')
+    for token in open_tokens:s.close_cursor(token)
+    s.call('POST','/cursors/next',{'cursor':frozen['cursor']},404)
+    require(s.stats()['cursors']==[],'closed cursors remained in stats')
+    released=s.call('POST','/vacuum',{'horizon':head});require(not released['pinned'] and released['horizon']==head,'closed cursor kept pinning versions')
+    # the snapshot is now reclaimed: any surviving token from that view is refused
+    s.call('POST','/cursors/next',{'cursor':second['cursor']},410)
+    # idle expiry is an explainable, recoverable failure
+    short=s.call('POST','/cursors',{'query':{'relation':'spectra','limit':1},'ttl_seconds':5},201);time.sleep(6)
+    expired=s.call('POST','/cursors/next',{'cursor':short['cursor']},410)
+    require(expired['error']['code']=='cursor_expired','expired cursor was not reported as cursor_expired')
+    # forged, closed and malformed tokens never resume a traversal
+    good=s.open_cursor(limit=1)['cursor'];s.close_cursor(good)
+    s.call('POST','/cursors/next',{'cursor':good},404)
+    s.call('POST','/cursors/next',{'cursor':good[:-2]+'AA'},404)
+    s.call('POST','/cursors/next',{'cursor':'lamina1.broken'},400)
+    # aggregate results cannot be paged; one-shot query keeps its old shape
+    s.call('POST','/cursors',{'query':{'relation':'spectra','aggregate':{'function':'count','column':'*'}}},400)
+    once=s.query(limit=2);require(once['truncated'] and 'cursor' not in once,'one-shot query semantics changed')
+    # a token survives a process restart and resumes the same snapshot view
+    durable=s.open_cursor(order=[{'column':'sample'}],limit=2,ttl=600)
+    durable_seen=[r['sample'] for r in durable['rows']]
+    s.stop();s.start()
+    resumed=s.next_page(durable['cursor'])
+    require(resumed['snapshot']==durable['snapshot'],'resumed cursor changed snapshot after restart')
+    durable_seen += [r['sample'] for r in resumed['rows']]
+    token=resumed.get('cursor')
+    while token:
+     page=s.next_page(token);durable_seen += [r['sample'] for r in page['rows']];token=page.get('cursor')
+    current=s.query(order=[{'column':'sample'}])
+    require(durable_seen==[r['sample'] for r in current['rows']],'restarted traversal diverged from current rows')
+    observations={'pages':len(pages),'snapshot':frozen_snap,'vacuum_pinned':vac,'released':released,'expired':expired['error']['code'],'resumed_after_restart':durable_seen}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:
